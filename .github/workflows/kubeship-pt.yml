@@ -1,0 +1,208 @@
+# Managed by Kubeship — builds the "pt" service from this repo
+# (Dockerfile) and pushes it to Artifact Registry via GitHub OIDC.
+# One file per service: other services from this repo have their own.
+name: "Kubeship · pt"
+on:
+  push:
+    # Only the branch this service deploys from builds. Every branch used to:
+    # a feature branch then failed at the registry login (Azure trusts the
+    # service's branch alone), and elsewhere it overwrote :latest and spent
+    # Actions minutes. Changing the branch in Kubeship rewrites this file.
+    branches: ['main']
+    # Order matters — a later pattern overrides an earlier one:
+    #  - any change builds…
+    #  - …except chart/config edits (deploy/**: they redeploy via ArgoCD)…
+    #  - …and Kubeship's workflow files, which are one per service: before,
+    #    writing one service's workflow (its Rebuild) built EVERY service in
+    #    the repo…
+    #  - …except THIS service's own file, so the commit that first adds it
+    #    (with deploy/**) still starts this service's first build.
+    paths:
+      - '**'
+      - '!deploy/**'
+      - '!.github/workflows/kubeship-*.yml'
+      - '.github/workflows/kubeship-pt.yml'
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner label for this run only (empty: the KUBESHIP_RUNNER variable, else GitHub-hosted)'
+        required: false
+        default: ''
+# A newer push (or Rebuild) cancels the build still running for an older one: only the newest commit is deployed.
+# Kubeship's one-off run on another runner (inputs.runner, services/runner-fallback.ts) keeps a lane of its own, so it
+# never cancels a real build, nor a real build it.
+concurrency:
+  group: kubeship-pt-${{ github.ref }}-${{ inputs.runner || 'build' }}
+  cancel-in-progress: true
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  build:
+    name: "build Dockerfile"
+    # Clusters run arm64, so the image is built natively on GitHub's arm64
+    # runner (available to private repositories since 2026-01-29), not under
+    # QEMU emulation on x86 — emulation made every RUN step several times
+    # slower, and EIP's PDF-export build was cancelled at the old 15 minutes.
+    # KUBESHIP_RUNNER (repo or org variable) names a self-hosted arm64 runner
+    # label to use instead, while GitHub-hosted runners won't start jobs. The
+    # dispatch input lets Kubeship send one run to GitHub-hosted to test whether
+    # they work again (services/runner-fallback.ts).
+    runs-on: ${{ inputs.runner || vars.KUBESHIP_RUNNER || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # GitHub's runner has little free disk, and the image is held twice (the
+      # local copy loaded for the scan, plus Trivy's own unpacked export). EIP's
+      # image reached ~630MB compressed and every build died "no space left on
+      # device". These preinstalled toolchains are unused here (~20GB).
+      - name: Free disk space
+        if: runner.environment == 'github-hosted'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+      # Kubeship lets this repository act as the push account just before the
+      # first build, and Google applies that within seconds to a few minutes.
+      # So the login waits it out (up to 5 min) instead of failing the build on
+      # the first "permission denied", as Azure/AWS logins never need to. Any
+      # other error (e.g. the pool is missing) fails at once.
+      - name: Log in to Google Cloud via OIDC
+        id: gcp-auth
+        env:
+          WIF_PROVIDER: projects/351701789656/locations/global/workloadIdentityPools/kubeship-github/providers/github
+          GCP_SA: kubeship-gcp-push@fiftyfivetech.iam.gserviceaccount.com
+        run: |
+          set -euo pipefail
+          ERR=""
+          for attempt in $(seq 1 30); do
+            OIDC=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://iam.googleapis.com/$WIF_PROVIDER" | jq -r .value)
+            STS=$(curl -sS -X POST https://sts.googleapis.com/v1/token -H 'Content-Type: application/json' \
+              -d "$(jq -n --arg a "//iam.googleapis.com/$WIF_PROVIDER" --arg t "$OIDC" '{audience: $a, subjectToken: $t,
+                grantType: "urn:ietf:params:oauth:grant-type:token-exchange",
+                requestedTokenType: "urn:ietf:params:oauth:token-type:access_token",
+                subjectTokenType: "urn:ietf:params:oauth:token-type:jwt",
+                scope: "https://www.googleapis.com/auth/cloud-platform"}')")
+            FED=$(echo "$STS" | jq -r '.access_token // empty')
+            if [ -z "$FED" ]; then
+              echo "::error::Google Cloud refused this repository's sign-in: $(echo "$STS" | jq -c .). Re-run the Kubeship grant script in the project, then press Rebuild."
+              exit 1
+            fi
+            RES=$(curl -sS -X POST "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/$GCP_SA:generateAccessToken" \
+              -H "Authorization: Bearer $FED" -H 'Content-Type: application/json' \
+              -d '{"scope": ["https://www.googleapis.com/auth/cloud-platform"], "lifetime": "3600s"}')
+            TOKEN=$(echo "$RES" | jq -r '.accessToken // empty')
+            if [ -n "$TOKEN" ]; then
+              echo "::add-mask::$TOKEN"
+              echo "access_token=$TOKEN" >> "$GITHUB_OUTPUT"
+              echo "Logged in to Google Cloud as $GCP_SA"
+              exit 0
+            fi
+            ERR=$(echo "$RES" | jq -c '.error // .')
+            if [ "$(echo "$RES" | jq -r '.error.status // empty')" != "PERMISSION_DENIED" ]; then
+              echo "::error::Google Cloud login failed: $ERR"
+              exit 1
+            fi
+            echo "Attempt $attempt/30: Google hasn't applied this repository's access yet — retrying in 10s"
+            sleep 10
+          done
+          echo "::error::Google Cloud still refuses this repository after 5 minutes: $ERR. Press Rebuild in Kubeship (it re-adds the access); if it persists, re-run the grant script."
+          exit 1
+      - name: Log in to Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: asia-south1-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.gcp-auth.outputs.access_token }}
+      - uses: docker/setup-buildx-action@v3
+      # Kubeship build variables (managed from the portal). Public ones live as
+      # repo Variables (KSB_PT__*) → passed as --build-arg (declare a matching
+      # ARG in your Dockerfile). Secret ones live as repo Secrets (KSB_PT__*) →
+      # BuildKit secret files (mounted only during RUN, never baked into image
+      # layers). Prefix-based so the portal adds/removes vars without editing this.
+      - name: Materialize Kubeship build variables
+        id: ksvars
+        env:
+          KS_VARS: ${{ toJSON(vars) }}
+          KS_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          set -euo pipefail
+          mkdir -p .ksbuild-secrets
+          BUILD_ARGS=""
+          for k in $(echo "$KS_VARS" | jq -r 'keys[]'); do
+            case "$k" in
+              KSB_PT__*)
+                name="${k#KSB_PT__}"
+                val="$(echo "$KS_VARS" | jq -r --arg k "$k" '.[$k]')"
+                BUILD_ARGS+="$name=$val"$'\n'
+              ;;
+            esac
+          done
+          SECRET_FILES=""
+          for k in $(echo "$KS_SECRETS" | jq -r 'keys[]'); do
+            case "$k" in
+              KSB_PT__*)
+                name="${k#KSB_PT__}"
+                echo "$KS_SECRETS" | jq -r --arg k "$k" '.[$k]' > ".ksbuild-secrets/$name"
+                SECRET_FILES+="$name=.ksbuild-secrets/$name"$'\n'
+              ;;
+            esac
+          done
+          {
+            echo "buildargs<<KSEOF"; printf '%s' "$BUILD_ARGS"; echo "KSEOF"
+            echo "secretfiles<<KSEOF"; printf '%s' "$SECRET_FILES"; echo "KSEOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Build and push (arm64, Artifact Registry layer cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          # push to Artifact Registry AND load the built image into the runner's local Docker,
+          # so the Trivy step scans it locally (no registry pull, no extra IAM).
+          outputs: |
+            type=registry
+            type=docker
+          build-args: ${{ steps.ksvars.outputs.buildargs }}
+          secret-files: ${{ steps.ksvars.outputs.secretfiles }}
+          # Remote layer cache stored in the same Artifact Registry repo (:buildcache) — makes
+          # subsequent builds much faster. image-manifest+oci flags are
+          # required for registry cache to work with ECR.
+          cache-from: type=registry,ref=asia-south1-docker.pkg.dev/fiftyfivetech/kubeship/kubeship/test-kubeship/pt:buildcache
+          cache-to: type=registry,ref=asia-south1-docker.pkg.dev/fiftyfivetech/kubeship/kubeship/test-kubeship/pt:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
+          tags: |
+            asia-south1-docker.pkg.dev/fiftyfivetech/kubeship/kubeship/test-kubeship/pt:sha-${{ github.sha }}
+            asia-south1-docker.pkg.dev/fiftyfivetech/kubeship/kubeship/test-kubeship/pt:latest
+      # Cloud-independent vulnerability scan of the built image (Trivy). Reports
+      # only — does not fail the build: exit-code '0' covers findings, and
+      # continue-on-error covers the scanner itself crashing (it once ran out of
+      # disk), which otherwise marked a build whose image was already pushed as
+      # failed, so it was never deployed. Kubeship pulls trivy.json from the
+      # run's artifacts and renders it on the service's Security tab.
+      # Cache Trivy's vulnerability DB (~40MB) across runs so it isn't re-downloaded.
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.trivycache
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: trivy-db-
+      - name: Vulnerability scan (Trivy)
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_CACHE_DIR: ${{ github.workspace }}/.trivycache
+        with:
+          # scans the locally-loaded image (from the build step above) — no pull
+          image-ref: asia-south1-docker.pkg.dev/fiftyfivetech/kubeship/kubeship/test-kubeship/pt:sha-${{ github.sha }}
+          version: v0.72.0
+          format: json
+          output: trivy.json
+          scanners: vuln
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: '0'
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results-pt
+          path: trivy.json
+          retention-days: 30
